@@ -1,0 +1,317 @@
+# Сервер новостей для сайта 222.
+# Раз в пять минут GitHub сам собирает все ленты, переводит их на русский
+# и публикует сайт вместе с готовым файлом news.json.
+# Этот же процесс публикует сайт при каждой правке файлов в репозитории.
+
+name: Сайт и новости
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Взять файлы сайта
+        uses: actions/checkout@v4
+
+      - name: Подготовить Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Собрать и перевести новости
+        env:
+          SITE_URL: https://romanowx.github.io/murdock/
+        run: |
+          cat > /tmp/fetch-news.mjs <<'SCRIPT_END'
+          // Сборщик новостей. Работает на серверах GitHub раз в пять минут:
+          // скачивает все ленты напрямую (без зеркал), переводит на русский
+          // и складывает готовый news.json рядом с сайтом.
+          import { writeFile } from 'node:fs/promises';
+
+          const SITE = process.env.SITE_URL || '';
+          const OUT = 'news.json';
+          const KEEP_MS = 3 * 864e5;
+          const MAX_ITEMS = 700;
+          const FEEDS = [{"n":"США · ФРС","u":"https://news.google.com/rss/search?q=%D0%A4%D0%A0%D0%A1%20%D1%81%D1%82%D0%B0%D0%B2%D0%BA%D0%B0%20OR%20%D0%9F%D0%B0%D1%83%D1%8D%D0%BB%D0%BB%20OR%20%D0%A4%D0%A0%D0%A1%20%D1%80%D0%B5%D1%88%D0%B5%D0%BD%D0%B8%D0%B5+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"США · доллар","u":"https://news.google.com/rss/search?q=%D0%BA%D1%83%D1%80%D1%81%20%D0%B4%D0%BE%D0%BB%D0%BB%D0%B0%D1%80%D0%B0%20OR%20%D0%B8%D0%BD%D0%B4%D0%B5%D0%BA%D1%81%20%D0%B4%D0%BE%D0%BB%D0%BB%D0%B0%D1%80%D0%B0%20OR%20%D1%82%D1%80%D0%B5%D0%B6%D0%B5%D1%80%D0%B8%D1%81+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"США · политика","u":"https://news.google.com/rss/search?q=%D0%A1%D0%A8%D0%90%20%D0%BF%D0%BE%D1%88%D0%BB%D0%B8%D0%BD%D1%8B%20OR%20%D0%A2%D1%80%D0%B0%D0%BC%D0%BF%20OR%20%D0%91%D0%B5%D0%BB%D1%8B%D0%B9%20%D0%B4%D0%BE%D0%BC%20%D1%81%D0%B0%D0%BD%D0%BA%D1%86%D0%B8%D0%B8+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"США · рынки","u":"https://news.google.com/rss/search?q=%D0%A1%D0%A8%D0%90%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D0%BE%20OR%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D0%B2%D0%B0%D0%BB%D1%8E%D1%82%D0%B0%20%D0%B1%D0%B8%D1%80%D0%B6%D0%B0+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"США · инфляция","u":"https://news.google.com/rss/search?q=%D0%B8%D0%BD%D1%84%D0%BB%D1%8F%D1%86%D0%B8%D1%8F%20%D0%A1%D0%A8%D0%90%20OR%20%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D0%B5%20%D0%BF%D0%BE%20%D0%B7%D0%B0%D0%BD%D1%8F%D1%82%D0%BE%D1%81%D1%82%D0%B8%20%D0%A1%D0%A8%D0%90+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"US markets","u":"https://news.google.com/rss/search?q=Fed%20OR%20dollar%20OR%20Treasury%20yields%20OR%20US%20inflation+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"US policy","u":"https://news.google.com/rss/search?q=White%20House%20OR%20Congress%20tariffs%20OR%20sanctions%20oil+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"Иран · нефть","u":"https://news.google.com/rss/search?q=%D0%98%D1%80%D0%B0%D0%BD%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20%D1%8D%D0%BA%D1%81%D0%BF%D0%BE%D1%80%D1%82%20%D0%BD%D0%B5%D1%84%D1%82%D0%B8%20%D0%98%D1%80%D0%B0%D0%BD+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Иран · санкции","u":"https://news.google.com/rss/search?q=%D0%98%D1%80%D0%B0%D0%BD%20%D1%81%D0%B0%D0%BD%D0%BA%D1%86%D0%B8%D0%B8%20OR%20%D1%8F%D0%B4%D0%B5%D1%80%D0%BD%D0%B0%D1%8F%20%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%D0%B0%20%D0%98%D1%80%D0%B0%D0%BD+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Иран · Ормуз","u":"https://news.google.com/rss/search?q=%D0%9E%D1%80%D0%BC%D1%83%D0%B7%D1%81%D0%BA%D0%B8%D0%B9%20%D0%BF%D1%80%D0%BE%D0%BB%D0%B8%D0%B2%20OR%20%D1%82%D0%B0%D0%BD%D0%BA%D0%B5%D1%80%20%D0%98%D1%80%D0%B0%D0%BD%20OR%20%D1%85%D1%83%D1%81%D0%B8%D1%82%D1%8B+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Iran markets","u":"https://news.google.com/rss/search?q=Iran%20oil%20OR%20sanctions%20OR%20Hormuz%20OR%20tanker+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"Iran nuclear","u":"https://news.google.com/rss/search?q=Iran%20nuclear%20talks%20OR%20Iranian%20exports%20OR%20rial+when:2d&hl=en-US&gl=US&ceid=US:en"},{"n":"Китай · юань","u":"https://news.google.com/rss/search?q=%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%8E%D0%B0%D0%BD%D1%8C%20OR%20%D0%9D%D0%B0%D1%80%D0%BE%D0%B4%D0%BD%D1%8B%D0%B9%20%D0%B1%D0%B0%D0%BD%D0%BA%20%D0%9A%D0%B8%D1%82%D0%B0%D1%8F%20OR%20%D0%BA%D1%83%D1%80%D1%81%20%D1%8E%D0%B0%D0%BD%D1%8F+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Китай · сырьё","u":"https://news.google.com/rss/search?q=%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20%D0%B8%D0%BC%D0%BF%D0%BE%D1%80%D1%82%20OR%20%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D0%BE%20OR%20%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%81%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D0%BE+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Китай · эконом","u":"https://news.google.com/rss/search?q=%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%8D%D0%BA%D0%BE%D0%BD%D0%BE%D0%BC%D0%B8%D0%BA%D0%B0%20OR%20%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%81%D1%82%D0%B8%D0%BC%D1%83%D0%BB%D1%8B%20OR%20%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%8D%D0%BA%D1%81%D0%BF%D0%BE%D1%80%D1%82+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"China markets","u":"https://news.google.com/rss/search?q=China%20oil%20imports%20OR%20gold%20OR%20yuan%20OR%20PBOC+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"China economy","u":"https://news.google.com/rss/search?q=China%20stimulus%20OR%20exports%20OR%20commodity%20demand+when:2d&hl=en-US&gl=US&ceid=US:en"},{"n":"Япония · иена","u":"https://news.google.com/rss/search?q=%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D1%8F%20%D0%B8%D0%B5%D0%BD%D0%B0%20OR%20%D0%BA%D1%83%D1%80%D1%81%20%D0%B8%D0%B5%D0%BD%D1%8B%20OR%20%D0%91%D0%B0%D0%BD%D0%BA%20%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D0%B8+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Япония · рынки","u":"https://news.google.com/rss/search?q=%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D1%8F%20%D0%BE%D0%B1%D0%BB%D0%B8%D0%B3%D0%B0%D1%86%D0%B8%D0%B8%20OR%20%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D1%8F%20%D0%B8%D0%BD%D1%84%D0%BB%D1%8F%D1%86%D0%B8%D1%8F%20OR%20%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D1%8F%20%D1%8D%D0%BA%D0%BE%D0%BD%D0%BE%D0%BC%D0%B8%D0%BA%D0%B0+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Japan rates","u":"https://news.google.com/rss/search?q=Bank%20of%20Japan%20OR%20yen%20OR%20JGB%20yields%20OR%20carry%20trade+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"Japan markets","u":"https://news.google.com/rss/search?q=Japan%20inflation%20OR%20Japan%20economy%20OR%20Nikkei+when:2d&hl=en-US&gl=US&ceid=US:en"},{"n":"Европа · ЕЦБ","u":"https://news.google.com/rss/search?q=%D0%95%D0%A6%D0%91%20%D1%81%D1%82%D0%B0%D0%B2%D0%BA%D0%B0%20OR%20%D0%B5%D0%B2%D1%80%D0%BE%D0%B7%D0%BE%D0%BD%D0%B0%20%D0%B8%D0%BD%D1%84%D0%BB%D1%8F%D1%86%D0%B8%D1%8F%20OR%20%D0%B5%D0%B2%D1%80%D0%BE%20%D0%BA%D1%83%D1%80%D1%81+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Россия · сырьё","u":"https://news.google.com/rss/search?q=%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20%D0%B3%D0%B0%D0%B7%20%D1%8D%D0%BA%D1%81%D0%BF%D0%BE%D1%80%D1%82%20OR%20%D1%80%D1%83%D0%B1%D0%BB%D1%8C%20%D0%BA%D1%83%D1%80%D1%81+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Ближний Восток","u":"https://news.google.com/rss/search?q=%D0%A1%D0%B0%D1%83%D0%B4%D0%BE%D0%B2%D1%81%D0%BA%D0%B0%D1%8F%20%D0%90%D1%80%D0%B0%D0%B2%D0%B8%D1%8F%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20%D0%9E%D0%9F%D0%95%D0%9A%20%D0%B7%D0%B0%D1%81%D0%B5%D0%B4%D0%B0%D0%BD%D0%B8%D0%B5%20OR%20%D0%9E%D0%90%D0%AD+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Индия и Азия","u":"https://news.google.com/rss/search?q=%D0%98%D0%BD%D0%B4%D0%B8%D1%8F%20%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D0%BE%20OR%20%D0%98%D0%BD%D0%B4%D0%B8%D1%8F%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20%D0%B0%D0%B7%D0%B8%D0%B0%D1%82%D1%81%D0%BA%D0%B8%D0%B5%20%D1%80%D1%8B%D0%BD%D0%BA%D0%B8+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Europe/World","u":"https://news.google.com/rss/search?q=ECB%20OR%20eurozone%20OR%20Bank%20of%20England%20OR%20euro+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"OPEC world","u":"https://news.google.com/rss/search?q=OPEC%20quota%20OR%20Saudi%20Arabia%20oil%20OR%20Russia%20exports+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"Нефть RU","u":"https://news.google.com/rss/search?q=%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20OR%20Brent%20OR%20%D0%B1%D0%B0%D1%80%D1%80%D0%B5%D0%BB%D1%8C%20OR%20%D0%BD%D0%B5%D1%84%D1%82%D1%8F%D0%BD%D0%BE%D0%B9%20%D1%80%D1%8B%D0%BD%D0%BE%D0%BA+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Золото RU","u":"https://news.google.com/rss/search?q=%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D0%BE%20%D1%86%D0%B5%D0%BD%D0%B0%20OR%20%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D1%8B%D0%B5%20%D1%80%D0%B5%D0%B7%D0%B5%D1%80%D0%B2%D1%8B%20OR%20%D1%81%D0%BB%D0%B8%D1%82%D0%BA%D0%B8+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Серебро RU","u":"https://news.google.com/rss/search?q=%D1%81%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D0%BE%20%D1%86%D0%B5%D0%BD%D0%B0%20OR%20%D1%81%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D0%BE%20%D1%81%D0%BF%D1%80%D0%BE%D1%81%20OR%20%D1%81%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D0%BE%20%D0%B4%D0%B5%D1%84%D0%B8%D1%86%D0%B8%D1%82+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Крипта RU","u":"https://news.google.com/rss/search?q=%D0%B1%D0%B8%D1%82%D0%BA%D0%BE%D0%B8%D0%BD%20OR%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D0%B2%D0%B0%D0%BB%D1%8E%D1%82%D0%B0%20OR%20%D1%8D%D1%84%D0%B8%D1%80%D0%B8%D1%83%D0%BC%20OR%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D1%80%D1%8B%D0%BD%D0%BE%D0%BA+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Крипта RU 2","u":"https://news.google.com/rss/search?q=%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D0%B1%D0%B8%D1%80%D0%B6%D0%B0%20OR%20%D1%81%D1%82%D0%B5%D0%B9%D0%B1%D0%BB%D0%BA%D0%BE%D0%B8%D0%BD%20OR%20%D0%BC%D0%B0%D0%B9%D0%BD%D0%B8%D0%BD%D0%B3%20OR%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%20ETF+when:2d&hl=ru&gl=RU&ceid=RU:ru"},{"n":"Срочно · рынки","u":"https://news.google.com/rss/search?q=oil%20OR%20gold%20OR%20bitcoin%20OR%20Fed+when:6h&hl=en-US&gl=US&ceid=US:en"},{"n":"Металлы · мир","u":"https://news.google.com/rss/search?q=gold%20OR%20silver%20price%20OR%20central%20bank%20gold+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"Крипта · мир","u":"https://news.google.com/rss/search?q=bitcoin%20OR%20ethereum%20OR%20crypto%20ETF%20OR%20SEC%20crypto+when:1d&hl=en-US&gl=US&ceid=US:en"},{"n":"ForkLog","u":"https://forklog.com/feed/"},{"n":"Bits.media","u":"https://bits.media/rss/news/"},{"n":"РБК Экономика","u":"https://rssexport.rbc.ru/rbcnews/economics/20/full.rss"},{"n":"РБК Крипто","u":"https://rssexport.rbc.ru/rbcnews/crypto/20/full.rss"},{"n":"ПРАЙМ","u":"https://1prime.ru/export/rss2/index.xml"},{"n":"CoinDesk","u":"https://www.coindesk.com/arc/outboundfeeds/rss/"},{"n":"OilPrice","u":"https://oilprice.com/rss/main"},{"n":"Bing · нефть","u":"https://www.bing.com/news/search?q=%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20%D0%9E%D0%9F%D0%95%D0%9A%20Brent%20%D1%86%D0%B5%D0%BD%D0%B0&format=RSS&setmkt=ru-RU"},{"n":"Bing · металлы","u":"https://www.bing.com/news/search?q=%D0%B7%D0%BE%D0%BB%D0%BE%D1%82%D0%BE%20%D1%81%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D0%BE%20%D1%86%D0%B5%D0%BD%D0%B0%20%D1%80%D1%8B%D0%BD%D0%BE%D0%BA&format=RSS&setmkt=ru-RU"},{"n":"Bing · крипта","u":"https://www.bing.com/news/search?q=%D0%B1%D0%B8%D1%82%D0%BA%D0%BE%D0%B8%D0%BD%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D0%B2%D0%B0%D0%BB%D1%8E%D1%82%D0%B0%20%D0%BA%D1%83%D1%80%D1%81&format=RSS&setmkt=ru-RU"},{"n":"Bing · ставки","u":"https://www.bing.com/news/search?q=%D0%A4%D0%A0%D0%A1%20%D1%81%D1%82%D0%B0%D0%B2%D0%BA%D0%B0%20%D0%B8%D0%BD%D1%84%D0%BB%D1%8F%D1%86%D0%B8%D1%8F%20%D0%B4%D0%BE%D0%BB%D0%BB%D0%B0%D1%80&format=RSS&setmkt=ru-RU"},{"n":"Bing · Иран","u":"https://www.bing.com/news/search?q=%D0%98%D1%80%D0%B0%D0%BD%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20%D1%81%D0%B0%D0%BD%D0%BA%D1%86%D0%B8%D0%B8%20%D0%9E%D1%80%D0%BC%D1%83%D0%B7&format=RSS&setmkt=ru-RU"},{"n":"Bing · Китай","u":"https://www.bing.com/news/search?q=%D0%9A%D0%B8%D1%82%D0%B0%D0%B9%20%D1%8E%D0%B0%D0%BD%D1%8C%20%D0%BD%D0%B5%D1%84%D1%82%D1%8C%20%D0%B8%D0%BC%D0%BF%D0%BE%D1%80%D1%82&format=RSS&setmkt=ru-RU"},{"n":"Bing · Япония","u":"https://www.bing.com/news/search?q=%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D1%8F%20%D0%B8%D0%B5%D0%BD%D0%B0%20%D0%91%D0%B0%D0%BD%D0%BA%20%D0%AF%D0%BF%D0%BE%D0%BD%D0%B8%D0%B8&format=RSS&setmkt=ru-RU"},{"n":"Bing · США","u":"https://www.bing.com/news/search?q=%D0%A1%D0%A8%D0%90%20%D1%8D%D0%BA%D0%BE%D0%BD%D0%BE%D0%BC%D0%B8%D0%BA%D0%B0%20%D0%BF%D0%BE%D1%88%D0%BB%D0%B8%D0%BD%D1%8B%20%D0%A2%D1%80%D0%B0%D0%BC%D0%BF&format=RSS&setmkt=ru-RU"},{"n":"Bing · world","u":"https://www.bing.com/news/search?q=oil%20gold%20bitcoin%20Fed%20markets&format=RSS&setmkt=en-US"},{"n":"Yahoo · oil","u":"https://news.search.yahoo.com/rss?p=crude%20oil%20OPEC%20price"},{"n":"Yahoo · metals","u":"https://news.search.yahoo.com/rss?p=gold%20silver%20price"},{"n":"Yahoo · crypto","u":"https://news.search.yahoo.com/rss?p=bitcoin%20crypto%20market"},{"n":"Yahoo · rates","u":"https://news.search.yahoo.com/rss?p=Federal%20Reserve%20rate%20inflation"},{"n":"Yahoo · Iran","u":"https://news.search.yahoo.com/rss?p=Iran%20oil%20sanctions%20Hormuz"},{"n":"Yahoo · China","u":"https://news.search.yahoo.com/rss?p=China%20yuan%20oil%20imports"},{"n":"Yahoo · Japan","u":"https://news.search.yahoo.com/rss?p=Bank%20of%20Japan%20yen%20yields"}];
+          const MARKET_RE = /(bitcoin|btc|ethereum|\beth\b|crypto|stablecoin|altcoin|token|gold|xau|bullion|silver|xag|\boil\b|crude|brent|wti|opec|petroleum|barrel|refinery|dollar|euro|yen|yuan|renminbi|rial|currency|forex|exchange rate|\busd\b|\beur\b|\bjpy\b|\bcny\b|\bdxy\b|interest rate|rate (cut|hike|decision)|central bank|inflation|\bcpi\b|treasury|bond|yield|sanction|tariff|tanker|hormuz|strait|pipeline|embargo|\betf\b|mining|mine\b|aramco|barrels|refin|drilling|биткоин|крипт|эфир|токен|золот|серебр|нефт|опек|баррел|нпз|доллар|евро|иен|юан|риал|валют|курс|ставк|инфляц|облигац|доходност|санкц|пошлин|танкер|ормуз|пролив|трубопровод|эмбарго|добыч|рудник|цб|фрс|ецб)/i;
+
+          function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+          function log(){ console.log.apply(console, arguments); }
+
+          async function get(url, ms){
+            const r = await fetch(url, {
+              headers: {
+                'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+                'accept': 'application/rss+xml, application/xml, text/xml, application/json, */*'
+              },
+              redirect: 'follow',
+              signal: AbortSignal.timeout(ms || 15000)
+            });
+            if(!r.ok) throw new Error('HTTP ' + r.status);
+            return await r.text();
+          }
+
+          /* ---- Разбор XML так же, как это делает браузер на сайте ---- */
+          const ENT = { amp:'&', lt:'<', gt:'>', quot:'"', apos:"'", nbsp:'\u00a0', laquo:'\u00ab', raquo:'\u00bb',
+            mdash:'\u2014', ndash:'\u2013', hellip:'\u2026', rsquo:'\u2019', lsquo:'\u2018', rdquo:'\u201d', ldquo:'\u201c' };
+          function decode(s){
+            return String(s).replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, function(m, e){
+              if(e[0] === '#'){
+                const c = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+                try { return String.fromCodePoint(c); } catch(err){ return m; }
+              }
+              const v = ENT[e.toLowerCase()];
+              return v === undefined ? m : v;
+            });
+          }
+          function xmlText(inner){
+            const re = /<!\[CDATA\[([\s\S]*?)\]\]>/g;
+            let out = '', last = 0, m;
+            while((m = re.exec(inner)) !== null){
+              out += decode(inner.slice(last, m.index)) + m[1];
+              last = re.lastIndex;
+            }
+            out += decode(inner.slice(last));
+            return out;
+          }
+          function field(block, name){
+            const re = new RegExp('<' + name + '\\b[^>]*>([\\s\\S]*?)<\\/' + name + '>', 'i');
+            const m = block.match(re);
+            return m ? xmlText(m[1]) : '';
+          }
+          function clean(html){
+            if(!html) return '';
+            return decode(String(html).replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]*>/g, ''))
+              .replace(/\s+/g, ' ').trim();
+          }
+          function host(u){ try { return new URL(u).hostname.replace(/^www\./, ''); } catch(e){ return ''; } }
+          function isRu(s){
+            const ru = (s.match(/[\u0400-\u04FF]/g) || []).length;
+            const la = (s.match(/[A-Za-z]/g) || []).length;
+            if(!ru && !la) return false;
+            return ru / (ru + la) > 0.45;
+          }
+          function cutRaw(s, n){
+            if(!s || s.length <= n) return s || '';
+            return s.slice(0, n).replace(/<[^>]*$/, '').replace(/&[#a-z0-9]*$/i, '');
+          }
+
+          /* То же преобразование, что делает сайт: из него получаются ключи перевода */
+          function view(feed, x){
+            let title = clean(x.t);
+            if(!title || title.length < 12) return null;
+            let desc = clean(x.x);
+            if(desc.length > 420) desc = desc.slice(0, 420) + '\u2026';
+            if(desc && desc.toLowerCase() === title.toLowerCase()) desc = '';
+            const srcHost = x.su ? host(x.su) : host(x.l);
+            if(srcHost === 'news.google.com' || feed.u.indexOf('news.google') > -1){
+              desc = '';
+              title = title.replace(/\s-\s[^-]{2,40}$/, '');
+            }
+            return { title: title, desc: desc };
+          }
+
+          function parseFeed(xml, feed){
+            const out = [];
+            const blocks = xml.match(/<(item|entry)\b[\s\S]*?<\/(item|entry)>/gi) || [];
+            const google = feed.u.indexOf('news.google') > -1;
+            for(const b of blocks){
+              const t = field(b, 'title').trim();
+              let l = field(b, 'link').trim();
+              if(!l){
+                const lm = b.match(/<link\b[^>]*href=["']([^"']+)["']/i);
+                l = lm ? decode(lm[1]) : '';
+              }
+              const dRaw = field(b, 'pubDate') || field(b, 'published') || field(b, 'updated') || field(b, 'dc:date');
+              let ts = Date.parse(dRaw.trim());
+              if(isNaN(ts)) ts = Date.now();
+              if(ts > Date.now() + 864e5) ts = Date.now();
+              let x = field(b, 'content:encoded') || field(b, 'description') || field(b, 'summary') || field(b, 'content');
+              let sn = '', su = '';
+              const sm = b.match(/<source\b([^>]*)>([\s\S]*?)<\/source>/i);
+              if(sm){
+                sn = xmlText(sm[2]).trim();
+                const um = sm[1].match(/url=["']([^"']+)["']/i);
+                if(um) su = decode(um[1]);
+              }
+              const srcHost = su ? host(su) : host(l);
+              if(google || srcHost === 'news.google.com'){
+                const hm = x.match(/href="(https?:\/\/(?!news\.google)[^"]+)"/);
+                if(hm) l = hm[1];
+                x = '';
+              } else {
+                x = cutRaw(x, 700);
+              }
+              out.push({ f: feed.n, t: t, l: l, d: new Date(ts).toISOString(), x: x, sn: sn, su: su });
+            }
+            return out;
+          }
+
+          /* ---- Перевод: сервер GitHub ходит в Google напрямую, без посредников ---- */
+          const GT = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ru&dt=t&q=';
+          async function gt(text){
+            const raw = await get(GT + encodeURIComponent(text), 20000);
+            const j = JSON.parse(raw);
+            return (j[0] || []).map(function(x){ return x[0] || ''; }).join('');
+          }
+          async function translateAll(texts, tr){
+            const todo = [];
+            const seen = new Set();
+            for(const t of texts){
+              if(!t || tr[t] || seen.has(t) || isRu(t)) continue;
+              seen.add(t); todo.push(t);
+            }
+            log('к переводу:', todo.length);
+            const groups = [];
+            let cur = [], len = 0;
+            for(const t of todo){
+              if(cur.length && (len + t.length > 1500 || cur.length >= 25)){ groups.push(cur); cur = []; len = 0; }
+              cur.push(t); len += t.length + 1;
+            }
+            if(cur.length) groups.push(cur);
+
+            let fails = 0, done = 0;
+            async function one(g){
+              try{
+                const out = await gt(g.join('\n'));
+                const lines = out.split('\n').map(function(s){ return s.trim(); }).filter(function(s){ return s.length; });
+                if(lines.length === g.length){
+                  g.forEach(function(src, k){ tr[src] = lines[k]; });
+                  done += g.length; fails = 0; return;
+                }
+              }catch(e){ fails++; }
+              for(const src of g){
+                try{
+                  const o = (await gt(src)).trim();
+                  if(o && o !== src){ tr[src] = o; done++; fails = 0; }
+                }catch(e){ fails++; }
+                await sleep(80);
+              }
+            }
+            for(let i = 0; i < groups.length; i += 3){
+              if(fails > 12){ log('переводчик перестал отвечать, остаток переведёт сайт'); break; }
+              await Promise.all(groups.slice(i, i + 3).map(one));
+              await sleep(150);
+            }
+            log('переведено:', done);
+          }
+
+          async function loadPrev(){
+            if(!SITE) return { items: [], tr: {} };
+            try{
+              const j = JSON.parse(await get(SITE + 'news.json?nocache=' + Date.now(), 20000));
+              return { items: j.items || [], tr: j.tr || {} };
+            }catch(e){
+              log('прошлой базы нет, начинаю с нуля');
+              return { items: [], tr: {} };
+            }
+          }
+
+          async function main(){
+            const started = Date.now();
+            const prev = await loadPrev();
+            const byName = new Map(FEEDS.map(function(f){ return [f.n, f]; }));
+            const map = new Map();
+            const cutoff = Date.now() - KEEP_MS;
+            for(const p of prev.items){
+              if(Date.parse(p.d) > cutoff) map.set(p.l || p.t, p);
+            }
+            log('из прошлой базы:', map.size);
+
+            let ok = 0, bad = 0, added = 0;
+            const queue = FEEDS.slice();
+            async function worker(){
+              while(queue.length){
+                const feed = queue.shift();
+                try{
+                  const xml = await get(feed.u, 15000);
+                  const items = parseFeed(xml, feed);
+                  ok++;
+                  for(const x of items){
+                    const f = byName.get(x.f) || feed;
+                    const v = view(f, x);
+                    if(!v) continue;
+                    if(!MARKET_RE.test(v.title + ' ' + v.desc)) continue;
+                    if(Date.parse(x.d) <= cutoff) continue;
+                    const k = x.l || x.t;
+                    if(!map.has(k)){ map.set(k, x); added++; }
+                  }
+                }catch(e){
+                  bad++;
+                  log('лента не ответила:', feed.n, '-', e.message);
+                }
+              }
+            }
+            await Promise.all(Array.from({ length: 8 }, worker));
+            log('лент ответило:', ok, 'из', FEEDS.length, '| новых новостей:', added);
+
+            const items = Array.from(map.values())
+              .sort(function(a, b){ return Date.parse(b.d) - Date.parse(a.d); })
+              .slice(0, MAX_ITEMS);
+
+            const texts = [];
+            for(const x of items){
+              const v = view(byName.get(x.f) || { n: x.f, u: '' }, x);
+              if(!v) continue;
+              texts.push(v.title);
+              if(v.desc) texts.push(v.desc.slice(0, 240));
+            }
+            const tr = {};
+            for(const t of texts) if(prev.tr[t]) tr[t] = prev.tr[t];
+            await translateAll(texts, tr);
+
+            const out = {
+              v: 1,
+              updated: new Date().toISOString(),
+              feedsOk: ok,
+              feedsTotal: FEEDS.length,
+              count: items.length,
+              items: items,
+              tr: tr
+            };
+            await writeFile(OUT, JSON.stringify(out));
+            log('готово:', items.length, 'новостей,', Object.keys(tr).length, 'переводов, за', Math.round((Date.now() - started) / 1000), 'с');
+          }
+
+          main().catch(async function(e){
+            console.error('сбой сборщика:', e && e.message);
+            // даже при сбое оставляем рабочую базу, чтобы сайт не остался пустым
+            try{
+              const prev = await loadPrev();
+              await writeFile(OUT, JSON.stringify({ v: 1, updated: new Date().toISOString(), items: prev.items, tr: prev.tr }));
+            }catch(e2){}
+          });
+
+          SCRIPT_END
+          node /tmp/fetch-news.mjs || echo "сборщик споткнулся — публикую сайт с прежней базой"
+
+      - name: Настроить публикацию
+        uses: actions/configure-pages@v5
+
+      - name: Упаковать сайт
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Опубликовать
+        id: deployment
+        uses: actions/deploy-pages@v4
